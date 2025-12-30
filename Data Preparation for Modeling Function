@@ -1,0 +1,28 @@
+def prepare_data_for_modeling(app_train_df, app_test_df, cols_to_drop, random_state=42):
+    # 1. Create X, y, and X_test_final
+    X = app_train_df.drop(["TARGET","SK_ID_CURR"], axis=1)
+    y = app_train_df["TARGET"]
+    X_test_final = app_test_df.drop(["SK_ID_CURR"], axis=1)
+    # 2. Drop specified columns from X and X_test_final
+    for col in cols_to_drop:
+        if col in X.columns:
+            X = X.drop(columns=[col])
+        if col in X_test_final.columns:
+            X_test_final = X_test_final.drop(columns=[col])
+    print("Columns dropped if they existed.")
+    # 3. Identify numeric and categorical features
+    numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_features = X.select_dtypes(include=["object"]).columns.tolist()
+    print("Features identified.")
+
+    # 4. Initialize ColumnTransformer (preprocessor)
+    preprocessor_lgbm = ColumnTransformer([
+       ("num", SimpleImputer(strategy="median"), numeric_features),
+       ("cat", Pipeline([
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore"))
+       ]), categorical_features)
+    ])
+    print("Preprocessor initialized.")
+    print("Data split into training and validation sets.")
+    return X, y, X_test_final, numeric_features, categorical_features, preprocessor_lgbm
