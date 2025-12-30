@@ -1,0 +1,45 @@
+def unified_credit_decision(
+    risk_score,
+    group,
+    group_thresholds,
+    EAD,
+    LGD,
+    fairness_gap,
+    fairness_limit=0.1,
+    loss_approve_th=50_000,
+    loss_review_th=150_000
+):
+    th = group_thresholds.get(group, 0.3)
+    expected_loss = risk_score * LGD * EAD
+
+    # ZONE (for explainability)
+    if risk_score < th * 0.8:
+        zone = "Green"
+    elif risk_score <= th:
+        zone = "Yellow"
+    else:
+        zone = "Red"
+
+    # FAIRNESS GUARD
+    if fairness_gap > fairness_limit:
+        return {
+            "decision": "REVIEW",
+            "zone": zone,
+            "expected_loss": expected_loss,
+            "reason": "Fairness constraint active"
+        }
+
+    # FINAL DECISION
+    if zone == "Green" and expected_loss < loss_approve_th:
+        decision = "APPROVE"
+    elif zone == "Yellow" or expected_loss < loss_review_th:
+        decision = "REVIEW"
+    else:
+        decision = "REJECT"
+
+    return {
+        "decision": decision,
+        "zone": zone,
+        "expected_loss": expected_loss,
+        "reason": "Risk–loss optimization"
+    }
