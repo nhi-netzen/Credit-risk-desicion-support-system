@@ -1,0 +1,1008 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import shap
+import matplotlib.pyplot as plt
+import json
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import confusion_matrix
+from google.colab import drive
+from sklearn.metrics import roc_curve
+from sklearn.metrics import accuracy_score, recall_score
+import joblib
+def clean_nan(df):
+    for col in df.columns:
+        if df[col].dtype == "object":
+            df[col] = df[col].fillna("Unknown")
+        else:
+            df[col] = df[col].fillna(df[col].median())
+    return df
+
+# Data Loading and Cleaning Function
+def load_and_clean_data(path):
+    app_train = pd.read_csv(path + "application_train.csv")
+    app_test  = pd.read_csv(path + "application_test.csv")
+    bureau = pd.read_csv(path + "bureau.csv")
+    bureau_bal = pd.read_csv(path + "bureau_balance.csv")
+    prev = pd.read_csv(path + "previous_application.csv")
+    pos = pd.read_csv(path + "POS_CASH_balance.csv")
+    install = pd.read_csv(path + "installments_payments.csv")
+    cc = pd.read_csv(path + "credit_card_balance.csv")
+
+    # Apply cleaning after loading
+    app_train = clean_nan(app_train)
+    app_test = clean_nan(app_test)
+    bureau = clean_nan(bureau)
+    bureau_bal = clean_nan(bureau_bal)
+    prev = clean_nan(prev)
+    pos = clean_nan(pos)
+    install = clean_nan(install)
+    cc = clean_nan(cc)
+
+    return app_train, app_test, bureau, bureau_bal, prev, pos, install, cc
+
+def clean_infinity(df):
+    return df.replace([np.inf, -np.inf], np.nan)
+
+# Feature Engineering Function
+def perform_feature_engineering(app_train_df, app_test_df, bureau_df, bureau_bal_df, prev_df, pos_df, install_df, cc_df):
+    print("Processing Bureau & Balance...")
+    bb_agg = bureau_bal_df.groupby('SK_ID_BUREAU').agg({
+        'MONTHS_BALANCE': ['min', 'max', 'size'],
+        'STATUS': ['nunique']
+    })
+    bb_agg.columns = pd.Index([e[0] + "_" + e[1].upper() for e in bb_agg.columns.tolist()])
+    bureau_df = bureau_df.join(bb_agg, on='SK_ID_BUREAU', how='left')
+    # Aggregating Bureau to Current ID
+    num_aggregations = {
+        'DAYS_CREDIT': ['min', 'max', 'mean', 'var'],
+        'DAYS_CREDIT_ENDDATE': ['min', 'max', 'mean'],
+        'DAYS_CREDIT_UPDATE': ['mean'],
+        'CREDIT_DAY_OVERDUE': ['max', 'mean'],
+        'AMT_CREDIT_MAX_OVERDUE': ['mean'],
+        'AMT_CREDIT_SUM': ['max', 'mean', 'sum'],
+        'AMT_CREDIT_SUM_DEBT': ['max', 'mean', 'sum'],
+        'AMT_CREDIT_SUM_OVERDUE': ['mean'],
+        'CNT_CREDIT_PROLONG': ['sum'],
+        'MONTHS_BALANCE_MIN': ['min'],
+        'MONTHS_BALANCE_MAX': ['max'],
+        'MONTHS_BALANCE_SIZE': ['mean', 'sum']
+    }
+    bureau_agg = bureau_df.groupby('SK_ID_CURR').agg(num_aggregations)
+    bureau_agg.columns = pd.Index(['BUREAU_' + e[0] + "_" + e[1].upper() for e in bureau_agg.columns.tolist()])
+    # Tỷ lệ được duyệt vay
+    prev_agg = prev_df.groupby('SK_ID_CURR').agg({
+        'AMT_ANNUITY': ['min', 'max', 'mean'],
+        'AMT_APPLICATION': ['min', 'max', 'mean'],
+        'AMT_CREDIT': ['min', 'max', 'mean'],
+        'AMT_DOWN_PAYMENT': ['min', 'max', 'mean'],
+        'DAYS_DECISION': ['min', 'max', 'mean'],
+        'CNT_PAYMENT': ['mean', 'sum'],
+        'NAME_CONTRACT_STATUS': lambda x: (x == 'Refused').mean() 
+    })
+    prev_agg.columns = pd.Index(['PREV_' + e[0] + "_" + e[1].upper() for e in prev_agg.columns.tolist()])
+    prev_agg.rename(columns={'PREV_NAME_CONTRACT_STATUS_<LAMBDA>': 'PREV_REFUSED_RATE'}, inplace=True)
+
+    pos_agg = pos_df.groupby('SK_ID_CURR').agg({
+        'MONTHS_BALANCE': ['max', 'mean', 'size'],
+        'SK_DPD': ['max', 'mean'], 
+        'SK_DPD_DEF': ['max', 'mean']
+    })
+    pos_agg.columns = pd.Index(['POS_' + e[0] + "_" + e[1].upper() for e in pos_agg.columns.tolist()])
+
+    print("Processing Installments...")
+    # Trả chậm bao nhiêu ngày, trả thiếu bao nhiêu tiền
+    install_df['DPD'] = install_df['DAYS_ENTRY_PAYMENT'] - install_df['DAYS_INSTALMENT']
+    install_df['DPD'] = install_df['DPD'].apply(lambda x: x if x > 0 else 0)
+    install_df['PAYMENT_DIFF'] = install_df['AMT_INSTALMENT'] - install_df['AMT_PAYMENT']
+
+    ins_agg = install_df.groupby('SK_ID_CURR').agg({
+        'DPD': ['max', 'mean', 'sum'], 
+        'PAYMENT_DIFF': ['max', 'mean', 'sum', 'var'], 
+        'AMT_INSTALMENT': ['max', 'mean', 'sum'],
+        'AMT_PAYMENT': ['min', 'max', 'mean', 'sum'],
+        'DAYS_ENTRY_PAYMENT': ['max', 'min', 'mean']
+    })
+    ins_agg.columns = pd.Index(['INSTAL_' + e[0] + "_" + e[1].upper() for e in ins_agg.columns.tolist()])
+
+    print("Processing Credit Card...")
+    cc_agg = cc_df.groupby('SK_ID_CURR').agg({
+        'MONTHS_BALANCE': ['min', 'max', 'size'],
+        'AMT_BALANCE': ['min', 'max', 'mean', 'sum'],
+        'AMT_CREDIT_LIMIT_ACTUAL': ['min', 'max', 'mean'],
+        'AMT_DRAWINGS_ATM_CURRENT': ['max', 'sum'],
+        'AMT_DRAWINGS_CURRENT': ['max', 'sum'],
+        'SK_DPD': ['mean', 'max']
+    })
+    cc_agg.columns = pd.Index(['CC_' + e[0] + "_" + e[1].upper() for e in cc_agg.columns.tolist()])
+    print("Merging all dataframes...")
+    app_train_df = app_train_df.merge(bureau_agg, on='SK_ID_CURR', how='left') \
+                               .merge(prev_agg, on='SK_ID_CURR', how='left') \
+                               .merge(pos_agg, on='SK_ID_CURR', how='left') \
+                               .merge(ins_agg, on='SK_ID_CURR', how='left') \
+                               .merge(cc_agg, on='SK_ID_CURR', how='left')
+
+    app_test_df = app_test_df.merge(bureau_agg, on='SK_ID_CURR', how='left') \
+                             .merge(prev_agg, on='SK_ID_CURR', how='left') \
+                               .merge(pos_agg, on='SK_ID_CURR', how='left') \
+                               .merge(ins_agg, on='SK_ID_CURR', how='left') \
+                               .merge(cc_agg, on='SK_ID_CURR', how='left')
+
+    for df in [app_train_df, app_test_df]:
+        df['CREDIT_INCOME_PERCENT'] = df['AMT_CREDIT'] / df['AMT_INCOME_TOTAL']
+        df['ANNUITY_INCOME_PERCENT'] = df['AMT_ANNUITY'] / df['AMT_INCOME_TOTAL']
+        df['CREDIT_TERM'] = df['AMT_ANNUITY'] / df['AMT_CREDIT']
+        df['DAYS_EMPLOYED_PERCENT'] = df['DAYS_EMPLOYED'] / df['DAYS_BIRTH']
+        df['DAYS_BIRTH'] = abs(df['DAYS_BIRTH'])
+        df['DAYS_EMPLOYED'] = abs(df['DAYS_EMPLOYED'])
+    app_train_df = clean_infinity(app_train_df)
+    app_test_df = clean_infinity(app_test_df)
+    print(f"Feature engineering complete. Train shape: {app_train_df.shape}")
+    return app_train_df, app_test_df
+# Data Preparation for Modeling Function
+def prepare_data_for_modeling(app_train_df, app_test_df, cols_to_drop, random_state=42):
+    # 1. Create X, y, and X_test_final
+    X = app_train_df.drop(["TARGET","SK_ID_CURR"], axis=1)
+    y = app_train_df["TARGET"]
+    X_test_final = app_test_df.drop(["SK_ID_CURR"], axis=1)
+    # 2. Drop specified columns from X and X_test_final
+    for col in cols_to_drop:
+        if col in X.columns:
+            X = X.drop(columns=[col])
+        if col in X_test_final.columns:
+            X_test_final = X_test_final.drop(columns=[col])
+    print("Columns dropped if they existed.")
+    # 3. Identify numeric and categorical features
+    numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_features = X.select_dtypes(include=["object"]).columns.tolist()
+    print("Features identified.")
+
+    # 4. Initialize ColumnTransformer (preprocessor)
+    preprocessor_lgbm = ColumnTransformer([
+       ("num", SimpleImputer(strategy="median"), numeric_features),
+       ("cat", Pipeline([
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore"))
+       ]), categorical_features)
+    ])
+    print("Preprocessor initialized.")
+    print("Data split into training and validation sets.")
+    return X, y, X_test_final, numeric_features, categorical_features, preprocessor_lgbm
+# Model Training and Prediction Function
+def train_and_predict_lgbm(X_train, y_train,w_train, X_val, y_val, preprocessor_lgbm):
+    X_train_proc = preprocessor_lgbm.fit_transform(X_train)
+    X_val_proc = preprocessor_lgbm.transform(X_val)
+    lgb_train = lgb.Dataset(X_train_proc, y_train, weight=w_train)
+    lgb_val = lgb.Dataset(X_val_proc, y_val, reference=lgb_train)
+    params = {
+      "objective": "binary",
+        "metric": "auc",
+        "boosting_type": "gbdt",
+        "learning_rate": 0.02,
+        "num_leaves": 34,
+        "max_depth": 8,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        "lambda_l1": 1.0,
+        "lambda_l2": 2.0,
+        "min_data_in_leaf": 50,
+        "n_jobs": -1,
+        "verbose": -1
+    }
+    print("Starting LightGBM training...")
+    bst = lgb.train(
+        params,
+        lgb_train,
+        num_boost_round=2000,
+        valid_sets=[lgb_train, lgb_val],
+        callbacks=[lgb.early_stopping(stopping_rounds=100), lgb.log_evaluation(100)]
+    )
+    print("LightGBM training complete.")
+    pred_lgb = bst.predict(X_val_proc)
+    return bst, pred_lgb, X_val_proc
+# Fairness Analysis Function
+def fairness_metrics(X, y_true, y_score, group_col, threshold, min_samples=1000):
+   df = X.copy()
+   df["y_true"] = y_true
+   df["y_pred"] = (y_score >= threshold).astype(int)
+   valid_groups = df[group_col].value_counts()
+   valid_groups = valid_groups[valid_groups > min_samples].index.tolist()
+   if len(valid_groups) < 2:
+        return {}, {"DP_gap": 0.0, "TPR_gap": 0.0, "FPR_gap": 0.0}
+   metrics = {}
+   for g in valid_groups:
+        dfg = df[df[group_col] == g]
+        try:
+            tn, fp, fn, tp = confusion_matrix(dfg["y_true"], dfg["y_pred"], labels=[0, 1]).ravel()
+            tpr = tp / (tp + fn + 1e-6)
+            fpr = fp / (fp + tn + 1e-6)
+        except ValueError:
+            tpr, fpr = 0.0, 0.0
+
+        metrics[g] = {
+            "DP": dfg["y_pred"].mean(), # Tỷ lệ được dự đoán là 1 (Default)
+            "TPR": tpr,
+            "FPR": fpr
+        }
+   # Tính Gap dựa trên các nhóm hợp lệ
+   dp_vals = [m["DP"] for m in metrics.values()]
+   tpr_vals = [m["TPR"] for m in metrics.values()]
+   fpr_vals = [m["FPR"] for m in metrics.values()]
+
+   gaps = {
+      "DP_gap": max(dp_vals) - min(dp_vals),
+      "TPR_gap": max(tpr_vals) - min(tpr_vals),
+      "FPR_gap": max(fpr_vals) - min(fpr_vals)
+   }
+   return metrics, gaps
+def compute_reweighing_weights(y, sensitive, eps=1e-6):
+    df = pd.DataFrame({"y": y, "a": sensitive})
+
+    p_y = df["y"].value_counts(normalize=True)
+    p_a = df["a"].value_counts(normalize=True)
+    p_ay = df.value_counts(normalize=True)
+
+    weights = []
+    for _, row in df.iterrows():
+        denom = p_ay.get((row["a"], row["y"]), eps)
+        w = (p_y[row["y"]] * p_a[row["a"]]) / denom
+        weights.append(w)
+
+    return np.array(weights)
+
+
+# FAIRNESS CONTROLLER
+def fairness_controller(scores, groups, base_threshold, epsilon=0.1, max_iter=100):
+    thresholds = {g: base_threshold for g in np.unique(groups)}
+    gap_history = []
+
+    for _ in range(max_iter):
+        preds = np.array([
+            int(scores[i] >= thresholds[groups[i]])
+            for i in range(len(scores))
+        ])
+
+        dp = {g: preds[groups == g].mean() for g in thresholds}
+        gap = max(dp.values()) - min(dp.values())
+        gap_history.append(gap)
+
+        if gap <= epsilon:
+            break
+
+        advantaged = max(dp, key=dp.get)
+        thresholds[advantaged] = min(thresholds[advantaged] + 0.01, 0.9)
+
+    return thresholds, gap_history
+def multi_objective_fairness_controller(
+    scores, y_true, groups, base_threshold, EAD,
+    lambda_dp=1.0,
+    lambda_tpr=1.0,
+    lambda_loss=0.5,
+    LGD=0.45,
+    epsilon=0.1,
+    max_iter=200
+):
+    thresholds = {g: base_threshold for g in np.unique(groups)}
+
+    for _ in range(max_iter):
+        preds = np.array([
+            int(scores[i] >= thresholds[groups[i]])
+            for i in range(len(scores))
+        ])
+
+        df = pd.DataFrame({
+            "y_true": y_true,
+            "y_pred": preds,
+            "score": scores,
+            "group": groups
+        })
+
+        metrics = {}
+        for g, dfg in df.groupby("group"):
+            tn, fp, fn, tp = confusion_matrix(
+                dfg["y_true"], dfg["y_pred"], labels=[0,1]
+            ).ravel()
+            metrics[g] = {
+                "DP": dfg["y_pred"].mean(),
+                "TPR": tp / (tp + fn + 1e-6)
+            }
+
+        dp_vals = [m["DP"] for m in metrics.values()]
+        tpr_vals = [m["TPR"] for m in metrics.values()]
+
+        dp_gap = max(dp_vals) - min(dp_vals)
+        tpr_gap = max(tpr_vals) - min(tpr_vals)
+
+        expected_loss = np.mean(preds * np.asarray(EAD) * LGD)
+
+        objective = (
+            lambda_dp * dp_gap +
+            lambda_tpr * tpr_gap +
+            lambda_loss * expected_loss
+        )
+
+        if dp_gap <= epsilon and tpr_gap <= epsilon:
+            break
+
+        worst_group = max(metrics, key=lambda g: metrics[g]["DP"])
+        thresholds[worst_group] += 0.01
+        thresholds[worst_group] = min(thresholds[worst_group], 0.9)
+
+    return thresholds, {
+        "DP_gap": dp_gap,
+        "TPR_gap": tpr_gap,
+        "Expected_Loss": expected_loss,
+        "Objective": objective
+    }
+def optimize_threshold_cost_benefit(
+    y_true, y_prob, EAD,
+    interest_rate=0.1, LGD=0.45, min_threshold= 0.05
+):
+    thresholds = np.linspace(min_threshold, 0.99, 100)
+    profits = []
+
+    for th in thresholds:
+        y_pred = (y_prob >= th).astype(int)
+
+        tn, fp, fn, tp = confusion_matrix(
+            y_true, y_pred, labels=[0, 1]
+        ).ravel()
+
+        # Profit = lãi từ khách GOOD - lỗ từ khách BAD
+        profit_good = np.sum((y_pred==0) * (y_true==0) * interest_rate * EAD)
+        loss_bad = np.sum((y_pred==0) * (y_true==1) * LGD * EAD)
+
+        profits.append(profit_good - loss_bad)
+
+    best_th = thresholds[np.argmax(profits)]
+    return best_th, thresholds, profits
+
+def equalized_odds_thresholding(
+    y_true, y_prob, groups,
+    base_threshold,
+    target_fpr=0.15,
+    min_delta=-0.1,
+    max_delta=0.1,
+    min_samples_per_group=10
+):
+    group_thresholds = {}
+    print(f"\n--- Debug Controller (Target FPR: {target_fpr}) ---")
+
+    unique_groups = np.unique(groups)
+
+    for g in unique_groups:
+        mask = (groups == g)
+        if mask.sum() < min_samples_per_group:
+            group_thresholds[g] = base_threshold
+            continue
+
+        y_true_g = y_true[mask]
+        y_prob_g = y_prob[mask]
+
+        if len(np.unique(y_true_g)) < 2:
+            group_thresholds[g] = base_threshold
+            continue
+
+        try:
+            fpr, tpr, ths = roc_curve(y_true_g, y_prob_g, drop_intermediate=False)
+            idx = np.argmin(np.abs(fpr - target_fpr))
+            best_th_group = ths[idx]
+
+            if np.isinf(best_th_group):
+                best_th_group = base_threshold
+
+            final_th = np.clip(best_th_group, base_threshold + min_delta, base_threshold + max_delta)
+
+            group_thresholds[g] = final_th
+            print(f"Group {g}: Base={base_threshold:.3f} -> New={final_th:.3f} (FPR={fpr[idx]:.3f})")
+
+        except Exception as e:
+            print(f"Group {g}: Error calc ROC ({e}). Using base threshold.")
+            group_thresholds[g] = base_threshold
+
+    return group_thresholds
+# Fairness check
+def fairness_check(dp_gap, threshold):
+    if dp_gap > threshold:
+        return "FAIRNESS_VIOLATION"
+    return "FAIR"
+
+def fairness_metrics_from_labels(X, y_true, y_pred, group_col, min_samples=50):
+    df = X.copy()
+    df["y_true"] = y_true
+    df["y_pred"] = y_pred
+
+    metrics = {}
+    group_counts = df[group_col].value_counts()
+
+    valid_groups = group_counts[group_counts >= min_samples].index.tolist()
+
+    print(f"\n--- Detailed Fairness Report (Min samples: {min_samples}) ---")
+    print(f"{'Group':<50} | {'Count':<6} | {'DP (Reject Rate)':<18} | {'TPR':<10} | {'FPR':<10}")
+    print("-" * 105)
+
+    for g in valid_groups:
+        dfg = df[df[group_col] == g]
+        tn, fp, fn, tp = confusion_matrix(
+            dfg["y_true"], dfg["y_pred"], labels=[0, 1]
+        ).ravel()
+
+        # DP (Demographic Parity): Tỷ lệ dự đoán là 1 (Default/Reject)
+        dp = dfg["y_pred"].mean()
+        tpr = tp / (tp + fn + 1e-6)
+        fpr = fp / (fp + tn + 1e-6)
+
+        metrics[g] = {"DP": dp, "TPR": tpr, "FPR": fpr}
+        print(f"{g:<50} | {len(dfg):<6} | {dp:.4f}             | {tpr:.4f}     | {fpr:.4f}")
+
+    if len(metrics) < 2:
+        return metrics, {"DP_gap": 0.0, "TPR_gap": 0.0, "FPR_gap": 0.0}
+
+    dp_vals = [m["DP"] for m in metrics.values()]
+    tpr_vals = [m["TPR"] for m in metrics.values()]
+    fpr_vals = [m["FPR"] for m in metrics.values()]
+
+    gaps = {
+       "DP_gap": max(dp_vals) - min(dp_vals),
+       "TPR_gap": max(tpr_vals) - min(tpr_vals),
+       "FPR_gap": max(fpr_vals) - min(fpr_vals)
+    }
+    return metrics, gaps
+def plot_fairness_metrics(metrics_before, metrics_after):
+    groups = list(metrics_before.keys())
+
+    dp_before = [metrics_before[g]["DP"] for g in groups]
+    dp_after = [metrics_after[g]["DP"] for g in groups]
+
+    plt.figure(figsize=(8,4))
+    x = np.arange(len(groups))
+    plt.bar(x-0.2, dp_before, width=0.4, label="Before")
+    plt.bar(x+0.2, dp_after, width=0.4, label="After")
+    plt.xticks(x, groups, rotation=45)
+    plt.ylabel("Demographic Parity")
+    plt.legend()
+    plt.title("Fairness Improvement After Controller")
+    plt.tight_layout()
+    plt.show()
+
+
+# SHAP Explanation Functions
+def plot_shap_summary(bst_model, X_val_processed, feature_names):
+    print("Generating SHAP summary plot...")
+    explainer = shap.TreeExplainer(bst_model)
+    if hasattr(X_val_processed, "toarray"):
+        X_sample = X_val_processed[:1000].toarray()
+    else:
+        X_sample = X_val_processed[:1000]
+    shap_values = explainer.shap_values(X_sample)
+
+    if isinstance(shap_values, list):
+        shap_values_to_plot = shap_values[1]
+    else:
+        shap_values_to_plot = shap_values
+
+    plt.figure(figsize=(10, 6)) #
+    shap.summary_plot(shap_values_to_plot, X_sample, feature_names=feature_names, show=False)
+    plt.title("SHAP Summary Plot")
+    plt.tight_layout()
+    plt.show()
+    print("SHAP summary plot displayed.")
+
+def plot_shap_force(bst_model, X_val_processed, feature_names, sample_index):
+    print(f"Generating SHAP force plot for sample index {sample_index}...")
+    explainer = shap.TreeExplainer(bst_model)
+
+    X_val_proc_df = pd.DataFrame(X_val_processed, columns=feature_names)
+
+    shap_values_ind = explainer.shap_values(X_val_proc_df.iloc[[sample_index]])
+
+    if isinstance(shap_values_ind, list):
+        shap_values_ind_to_plot = shap_values_ind[1][0]
+    else:
+        shap_values_ind_to_plot = shap_values[0]
+
+    expected_value_to_plot = explainer.expected_value
+    if isinstance(expected_value_to_plot, list):
+        expected_value_to_plot = expected_value_to_plot[1]
+
+    plt.figure(figsize=(12, 4))
+    shap.force_plot(
+        expected_value_to_plot,
+        shap_values_ind_to_plot,
+        X_val_proc_df.iloc[sample_index],
+        show=False
+    )
+    plt.title(f"SHAP Force Plot for Sample {sample_index}")
+    plt.tight_layout()
+    plt.show()
+    print(f"SHAP force plot for sample index {sample_index} displayed.")
+
+def analyze_shap_by_group(bst_model, X_val_processed, X_val_original, feature_names, group_col):
+    print(f"Analyzing SHAP values by group: {group_col} for proxy detection...")
+    explainer = shap.TreeExplainer(bst_model)
+    shap_values = explainer.shap_values(X_val_processed)
+
+    if isinstance(shap_values, list):
+        shap_values_to_analyze = shap_values[1]
+    else:
+        shap_values_to_analyze = shap_values
+
+    shap_df = pd.DataFrame(shap_values_to_analyze, columns=feature_names)
+
+    if group_col in X_val_original.columns:
+        shap_df[group_col] = X_val_original[group_col].values
+    else:
+        print(f"Warning: Group column '{group_col}' not found in X_val_original. Cannot perform group analysis.")
+        return
+
+    group_shap = shap_df.groupby(group_col).mean().T
+
+    if group_shap.shape[1] > 1:
+        group1_name = group_shap.columns[0]
+        group2_name = group_shap.columns[1]
+        group_shap['abs_diff'] = abs(group_shap[group1_name] - group_shap[group2_name])
+        print(f"Top features with largest absolute SHAP value differences between {group1_name} and {group2_name}:")
+        print(group_shap.sort_values('abs_diff', ascending=False).head(15))
+    else:
+        print("Not enough groups for difference calculation.")
+    print("SHAP analysis by group complete.")
+FEATURE_REASON_MAP = {
+    "CREDIT_INCOME_PERCENT": "High loan-to-income ratio",
+    "AMT_ANNUITY": "High monthly repayment burden",
+    "DAYS_EMPLOYED": "Short employment history",
+    "DAYS_BIRTH": "Young applicant age",
+    "EXT_SOURCE_1": "Low external credit score",
+    "EXT_SOURCE_2": "Low external credit score",
+    "EXT_SOURCE_3": "Low external credit score",
+    "BUREAU_AMT_CREDIT_SUM_SUM": "High outstanding credit from credit bureau",
+    "BUREAU_DAYS_CREDIT_MEAN": "Recent credit activity",
+    "AMT_CREDIT": "Large requested loan amount",
+}
+def proxy_discrimination_score(shap_df, group_col):
+    group_means = shap_df.groupby(group_col).mean()
+    return (group_means.max() - group_means.min()).abs().sort_values(ascending=False)
+
+def generate_reason_for_rejection(
+    shap_explanations,
+    max_reasons=3
+):
+    reasons = []
+
+    for item in shap_explanations["top_positive_factors"]:
+        feat = item["feature"]
+
+        # clean feature name
+        clean_feat = feat.replace("num__", "").replace("cat__", "")
+
+        for key in FEATURE_REASON_MAP:
+            if key in clean_feat:
+                reasons.append(FEATURE_REASON_MAP[key])
+                break
+
+        if len(reasons) >= max_reasons:
+            break
+
+    if not reasons:
+        reasons.append("Overall high predicted credit risk")
+
+    return list(dict.fromkeys(reasons))  # unique
+
+
+# Risk Level and Confidence Logic
+def get_risk_assessment(risk_score, low_risk_threshold=0.1, medium_risk_threshold=0.3,
+                        low_confidence_threshold=0.05, high_confidence_threshold=0.5):
+    """
+    Determines risk level and confidence based on risk score (probability of default).
+
+    Args:
+        risk_score (float): Predicted probability of default (PD).
+        low_risk_threshold (float): PD below this is LOW risk.
+        medium_risk_threshold (float): PD below this is MEDIUM risk (above low_risk_threshold).
+        low_confidence_threshold (float): PD near 0 or 1 less than this implies LOW confidence (uncertainty).
+        high_confidence_threshold (float): PD near 0 or 1 greater than this implies HIGH confidence.
+
+    Returns:
+        tuple: (risk_level, confidence)
+    """
+    if risk_score < low_risk_threshold:
+        risk_level = 'LOW'
+    elif risk_score < medium_risk_threshold:
+        risk_level = 'MEDIUM'
+    else:
+        risk_level = 'HIGH'
+
+    certainty = max(risk_score, 1 - risk_score)
+
+    if certainty > high_confidence_threshold:
+        confidence = 'HIGH'
+    elif certainty > low_confidence_threshold:
+        confidence = 'MEDIUM'
+    else:
+        confidence = 'LOW'
+    return risk_level, confidence
+
+# Decision Engineer
+def unified_credit_decision(
+    risk_score,
+    group,
+    group_thresholds,
+    EAD,
+    LGD,
+    fairness_gap,
+    fairness_limit=0.1,
+    loss_approve_th=50_000,
+    loss_review_th=150_000
+):
+    th = group_thresholds.get(group, 0.3)
+    expected_loss = risk_score * LGD * EAD
+
+    # ZONE (for explainability)
+    if risk_score < th * 0.8:
+        zone = "Green"
+    elif risk_score <= th:
+        zone = "Yellow"
+    else:
+        zone = "Red"
+
+    # FAIRNESS GUARD
+    if fairness_gap > fairness_limit:
+        return {
+            "decision": "REVIEW",
+            "zone": zone,
+            "expected_loss": expected_loss,
+            "reason": "Fairness constraint active"
+        }
+
+    # FINAL DECISION
+    if zone == "Green" and expected_loss < loss_approve_th:
+        decision = "APPROVE"
+    elif zone == "Yellow" or expected_loss < loss_review_th:
+        decision = "REVIEW"
+    else:
+        decision = "REJECT"
+
+    return {
+        "decision": decision,
+        "zone": zone,
+        "expected_loss": expected_loss,
+        "reason": "Risk–loss optimization"
+    }
+
+def make_intersectional_group(df, protected_attrs, min_samples=50):
+    df_groups = df.copy()
+    for col in protected_attrs:
+        counts = df_groups[col].value_counts()
+        rare_values = counts[counts < min_samples].index
+        if len(rare_values) > 0:
+            print(f"Col {col}: Gộp các giá trị hiếm {list(rare_values)} thành 'Other'")
+            df_groups[col] = df_groups[col].replace(rare_values, 'Other')
+    return df_groups[protected_attrs].astype(str).agg("__".join, axis=1)
+
+# Extract Top SHAP Factors for Explanation
+def get_shap_explanations_for_sample(bst_model, X_processed_sample, feature_names, top_n=5):
+    explainer = shap.TreeExplainer(bst_model)
+
+    if isinstance(X_processed_sample, pd.Series):
+        X_processed_sample_2d = X_processed_sample.to_frame().T
+    elif isinstance(X_processed_sample, np.ndarray):
+        X_processed_sample_2d = X_processed_sample.reshape(1, -1)
+    else:
+        raise ValueError("X_processed_sample must be a pandas Series or numpy array.")
+
+    shap_values = explainer.shap_values(X_processed_sample_2d)
+
+    if isinstance(shap_values, list):
+        shap_values_for_sample = shap_values[1][0]
+    else:
+        shap_values_for_sample = shap_values[0]
+    shap_df = pd.DataFrame({
+        'feature_raw': feature_names,
+        'feature': [humanize_feature_name(f) for f in feature_names],
+        'shap_value': shap_values_for_sample
+    })
+
+    shap_df_sorted = shap_df.sort_values(by='shap_value', ascending=False)
+    shap_df["impact"] = shap_df["shap_value"].apply(lambda x: "Tăng rủi ro" if x > 0 else "Giảm rủi ro")
+    top_positive_factors = shap_df_sorted.head(top_n).to_dict(orient='records')
+    top_negative_factors = shap_df_sorted.tail(top_n).sort_values(by='shap_value', ascending=True).to_dict(orient='records')
+    return {
+        "top_positive_factors": top_positive_factors,
+        "top_negative_factors": top_negative_factors
+    }
+FEATURE_NAME_MAPPING = {
+    "num__BUREAU_DAYS_CREDIT_ENDDATE_MAX":
+        "Thời gian còn lại dài nhất của các khoản vay tại CIC",
+
+    "num__DAYS_LAST_PHONE_CHANGE":
+        "Số ngày kể từ lần thay đổi số điện thoại gần nhất",
+
+    "num__DAYS_BIRTH":
+        "Tuổi của khách hàng",
+
+    "num__DAYS_EMPLOYED_PERCENT":
+        "Tỷ lệ thời gian làm việc so với độ tuổi",
+
+    "num__EXT_SOURCE_1":
+        "Điểm tín dụng từ nguồn bên ngoài (nguồn 1)",
+
+    "num__EXT_SOURCE_2":
+        "Điểm tín dụng từ nguồn bên ngoài (nguồn 2)",
+
+    "num__EXT_SOURCE_3":
+        "Điểm tín dụng từ nguồn bên ngoài (nguồn 3)",
+
+    "num__INSTAL_DPD_MEAN":
+        "Số ngày trễ hạn trung bình khi trả góp",
+
+    "num__AMT_ANNUITY":
+        "Số tiền phải trả hàng tháng",
+
+    "cat__OCCUPATION_TYPE_Medicine staff":
+        "Nghề nghiệp: Nhân viên y tế",
+
+    "cat__CODE_GENDER_M":
+        "Giới tính: Nam",
+
+    "cat__CODE_GENDER_F":
+        "Giới tính: Nữ"
+}
+def humanize_feature_name(feature_name: str) -> str:
+    if feature_name in FEATURE_NAME_MAPPING:
+        return FEATURE_NAME_MAPPING[feature_name]
+    if feature_name.startswith("cat__"):
+        raw = feature_name.replace("cat__", "")
+        if "_" in raw:
+            col, val = raw.split("_", 1)
+            return f"{col.replace('_', ' ').title()}: {val}"
+        return raw.replace("_", " ").title()
+    if feature_name.startswith("num__"):
+        return feature_name.replace("num__", "").replace("_", " ").title()
+    return feature_name
+import gc
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+
+# Main Workflow Function
+def main():
+    # Ensure Google Drive is mounted
+    drive.mount('/content/drive', force_remount=True)
+
+    # Define parameters
+    path = '/content/drive/MyDrive/Credit Risk Decision Support System (CRDSS)/DATA FINTECH/'
+    drop_cols = ["REGION_RATING_CLIENT", "DAYS_EMPLOYED"]
+    protected_attrs = ["CODE_GENDER","NAME_EDUCATION_TYPE","NAME_INCOME_TYPE"]
+
+    FAIRNESS_THRESHOLD = 0.15
+    LGD = 0.45 # Loss Given Default
+    sample_idx_for_output = 0
+
+    try:
+        app_train, app_test, bureau, bureau_bal, prev, pos, install, cc = load_and_clean_data(path)
+    except FileNotFoundError:
+        print("Lỗi: Không tìm thấy đường dẫn dữ liệu. Hãy kiểm tra lại biến 'path'.")
+        return None, None, None, None, None, None, None, None, None, None, None, None
+
+    # 2. Perform Feature Engineering
+    app_train, app_test = perform_feature_engineering(app_train, app_test, bureau, bureau_bal, prev, pos, install, cc)
+
+    # --- OPTIMIZATION: Clear memory ---
+    del bureau, bureau_bal, prev, pos, install, cc
+    gc.collect()
+
+    # PREPARE DATA
+    X, y, X_test_final, numeric_features, categorical_features, preprocessor_lgbm = \
+        prepare_data_for_modeling(app_train, app_test, drop_cols)
+
+    # First, create the intersectional group for the entire dataset (X)
+    X_filled_for_groups = X.copy()
+    for col in protected_attrs:
+        X_filled_for_groups[col] = X_filled_for_groups[col].fillna("Unknown")
+    A_full = make_intersectional_group(X_filled_for_groups, protected_attrs, min_samples=100)
+
+    # Handle rare groups in A_full for stratification purposes
+    group_counts = A_full.value_counts()
+    rare_groups = group_counts[group_counts < 5].index
+    A_stratify = A_full.replace(rare_groups, 'RARE_GROUP')
+
+    # TRAIN / VALIDATION SPLIT
+    X_train, X_val, y_train, y_val, A_train, A_val = train_test_split(
+        X, y, A_full, test_size=0.2, random_state=42, stratify=A_stratify # Use A_stratify here
+    )
+
+    w_train = compute_reweighing_weights(y_train, A_train)
+    if np.std(w_train) < 1e-6:
+        print(" Cảnh báo: Weights (w_train) gần như bằng nhau. Reweighing không có tác dụng.")
+    # 4. Train LightGBM Model and Predict
+    bst, pred_lgb, X_val_proc = train_and_predict_lgbm(X_train, y_train, w_train, X_val, y_val, preprocessor_lgbm)
+    # FAIRNESS BEFORE
+    X_val_filled = X_val.copy()
+    for col in protected_attrs:
+        X_val_filled[col] = X_val_filled[col].fillna("Unknown")
+    A_val = make_intersectional_group(X_val_filled, protected_attrs)
+    EAD = X_val["AMT_CREDIT"].fillna(0).values
+    best_global_th, th_range, profits = optimize_threshold_cost_benefit(
+      y_val, pred_lgb, EAD, interest_rate=0.1, LGD=0.45, min_threshold=0.05)
+    fair_before, gap_before = fairness_metrics(
+       X_val.assign(A=A_val),
+       y_val,
+       pred_lgb,
+       group_col="A",
+       threshold=best_global_th
+    )
+
+    print("Fairness before control:", gap_before)
+
+    # FAIRNESS CONTROLLER
+    EAD = X_val["AMT_CREDIT"].fillna(0).values
+    best_global_th, th_range, profits = optimize_threshold_cost_benefit(
+        y_val, pred_lgb, EAD, interest_rate=0.1, LGD=0.45)
+    group_ths = equalized_odds_thresholding(y_true=y_val.values, y_prob=pred_lgb, groups=A_val.values, base_threshold=best_global_th, target_fpr=0.15,min_delta=-0.05, max_delta=0.05, min_samples_per_group=30)
+
+    print("Thresholds công bằng cho từng nhóm khách hàng:")
+    for g, th in group_ths.items():
+        print(f" - Nhóm {g}: {th:.4f}")
+
+    # 3. Chạy Decision Engine cho khách hàng cụ thể
+    results = []
+    for i in range(len(X_val)):
+        risk_score = pred_lgb[i]
+        group = A_val.iloc[i]
+
+        decision_out = unified_credit_decision(
+            risk_score=risk_score,
+            group=group,
+            group_thresholds=group_ths,
+            EAD=X_val.iloc[i]["AMT_CREDIT"],
+            LGD=LGD,
+            fairness_gap=gap_before.get("DP_gap", 0)
+         )
+
+        results.append({
+           "Risk_Score": risk_score,
+           "Group": group,
+           "Decision": decision_out["decision"],
+           "Zone": decision_out["zone"],
+           "Expected_Loss": decision_out["expected_loss"]
+         })
+
+    decision_df = pd.DataFrame(results)
+    print("\nThống kê quyết định cuối cùng:")
+    print(decision_df['Zone'].value_counts(normalize=True))
+
+    # Vẽ biểu đồ Cost-Benefit
+    plt.plot(th_range, profits)
+    plt.axvline(best_global_th, color='r', linestyle='--', label=f'Best Threshold: {best_global_th:.2f}')
+    plt.title("Tối ưu hóa lợi nhuận kinh tế (Cost-Benefit Curve)")
+    plt.xlabel("Threshold")
+    plt.ylabel("Expected Profit")
+    plt.legend()
+    plt.show()
+    # APPLY CONTROLLER
+    y_pred_controlled = []
+    for idx in range(len(X_val)):
+        group = A_val.iloc[idx]
+        th = group_ths.get(group, best_global_th)
+        y_pred_controlled.append(int(pred_lgb[idx] >= th))
+    y_pred_controlled = np.array(y_pred_controlled)
+
+    # FAIRNESS AFTER
+    fair_after, gap_after = fairness_metrics_from_labels(X_val.assign(A=A_val),y_val,y_pred_controlled,group_col="A")
+    print("Fairness after control:", gap_after)
+    # Get feature names after preprocessing
+    feature_names = preprocessor_lgbm.get_feature_names_out().tolist()
+    print(f"Total features after preprocessing: {len(feature_names)}")
+    # Evaluate AUC (optional, for logging)
+    auc_lgbm = roc_auc_score(y_val, pred_lgb)
+    print(f"\nAUC LGBM (on validation set): {auc_lgbm}")
+    # ABLATION STUDY
+    auc_lgb = roc_auc_score(y_val, pred_lgb)
+    recall_lgb = recall_score(y_val, (pred_lgb >= best_global_th).astype(int))
+    auc_controlled = auc_lgb
+    recall_controlled = recall_score(y_val, y_pred_controlled)
+
+    rows = []
+    rows.append(["LGBM (raw)", auc_lgb, recall_lgb, gap_before.get("DP_gap", 0)])
+    rows.append(["LGBM + controller", auc_controlled, recall_controlled, gap_after.get("DP_gap", 0)])
+
+    exp_df = pd.DataFrame(rows, columns=["Model", "AUC", "Recall", "DP_gap"])
+    print("\n=== Ablation Study ===")
+    print(exp_df)
+    # 5. Perform Fairness Analysis
+    fairness_status = "FAIR"
+    if gap_after.get("DP_gap", 0) > FAIRNESS_THRESHOLD:
+       fairness_status = "FAIRNESS_VIOLATION"
+    # Generate JSON Output for a Sample
+    sample_risk_score = pred_lgb[sample_idx_for_output]
+    sample_original_features = X_val.iloc[sample_idx_for_output]
+    sample_processed_features = X_val_proc[sample_idx_for_output]
+    if hasattr(sample_processed_features, "toarray"):
+        sample_processed_features = sample_processed_features.toarray()[0]
+
+    sample_amt_credit = sample_original_features['AMT_CREDIT'] if 'AMT_CREDIT' in sample_original_features else 0
+
+    # Calculate Expected Loss for the sample
+    sample_expected_loss = sample_risk_score * sample_amt_credit * LGD
+
+    # Get Decision, Risk Level, and Confidence for the sample
+    decision_output = unified_credit_decision(
+       risk_score=sample_risk_score,
+       group=A_val.iloc[sample_idx_for_output],
+       group_thresholds=group_ths,
+       EAD=sample_amt_credit,
+       LGD=LGD,
+       fairness_gap=gap_after.get("DP_gap", 0)
+     )
+
+    # Get SHAP Explanations for the sample
+    explanations = get_shap_explanations_for_sample(bst, sample_processed_features, feature_names)
+    rejection_reasons = []
+    if decision_output["decision"] == "REJECT":
+       rejection_reasons = generate_reason_for_rejection(explanations)
+
+    # Construct the final JSON output
+    output_json = {
+       "customer_id": int(app_train.loc[X_val.index[sample_idx_for_output], "SK_ID_CURR"]),
+       "predicted_risk_score": float(sample_risk_score),
+       "decision": decision_output["decision"],
+       "zone": decision_output["zone"],
+       "expected_loss": float(decision_output["expected_loss"]),
+       "fairness_status": fairness_status,
+       "explanations": explanations
+     }
+    print("\n--- Credit Risk Assessment Output (JSON) for Sample ---")
+    print(json.dumps(output_json, indent=4, cls=NumpyEncoder))
+
+    # DEPLOYMENT TEST (application_test)
+    print("Running Deployment Test on application_test.csv...")
+    X_test_proc = preprocessor_lgbm.transform(X_test_final)
+    pd_test = bst.predict(X_test_proc)
+
+    app_test_filled = app_test.copy()
+    for col in protected_attrs:
+        app_test_filled[col] = app_test_filled[col].fillna("Unknown")
+    A_test = make_intersectional_group(app_test_filled, protected_attrs)
+
+    decisions_test = []
+    for i in range(len(pd_test)):
+        group = A_test.iloc[i]
+        th = group_ths.get(group, best_global_th)
+        decisions_test.append(int(pd_test[i] >= th)) # 1 = Default (Reject), 0 = Repay (Approve)
+
+    app_test_result = app_test[["SK_ID_CURR", "CODE_GENDER", "AMT_CREDIT"]].copy()
+    app_test_result["PD"] = pd_test
+    # Nếu PD >= threshold -> Predict Default (1) -> REJECT
+    # Nếu PD < threshold -> Predict Repay (0) -> APPROVE
+    app_test_result["Decision"] = np.where(
+      np.array(decisions_test)==1, "REJECT", "APPROVE"
+    )
+    app_test_result["Expected_Loss"] = (
+       app_test_result["PD"] *
+       app_test_result["AMT_CREDIT"] *
+       LGD
+    )
+    print("\n--- DEPLOYMENT OUTPUT (application_test) ---")
+    print(app_test_result.head())
+    if 'CODE_GENDER' in X_val.columns:
+        analyze_shap_by_group(bst, X_val_proc, X_val, feature_names, group_col='CODE_GENDER')
+    else:
+        print("Warning: CODE_GENDER not found in X_val for SHAP group analysis.")
+
+    plot_fairness_metrics(fair_before, fair_after)
+    return bst, X_val, y_val, pred_lgb, y_pred_controlled, fair_before, fair_after, feature_names, exp_df, X_val_proc, gap_before, preprocessor_lgbm
+if __name__ == '__main__':
+    bst, X_val, y_val, pred_lgb, y_pred_controlled, fair_before, fair_after, feature_names, exp_df, X_val_proc, gap_before, preprocessor_lgbm = main()
+   
+   
