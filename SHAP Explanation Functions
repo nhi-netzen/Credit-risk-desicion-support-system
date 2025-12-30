@@ -1,0 +1,69 @@
+def analyze_shap_by_group(bst_model, X_val_processed, X_val_original, feature_names, group_col):
+    print(f"Analyzing SHAP values by group: {group_col} for proxy detection...")
+    explainer = shap.TreeExplainer(bst_model)
+    shap_values = explainer.shap_values(X_val_processed)
+
+    if isinstance(shap_values, list):
+        shap_values_to_analyze = shap_values[1]
+    else:
+        shap_values_to_analyze = shap_values
+
+    shap_df = pd.DataFrame(shap_values_to_analyze, columns=feature_names)
+
+    if group_col in X_val_original.columns:
+        shap_df[group_col] = X_val_original[group_col].values
+    else:
+        print(f"Warning: Group column '{group_col}' not found in X_val_original. Cannot perform group analysis.")
+        return
+
+    group_shap = shap_df.groupby(group_col).mean().T
+
+    if group_shap.shape[1] > 1:
+        group1_name = group_shap.columns[0]
+        group2_name = group_shap.columns[1]
+        group_shap['abs_diff'] = abs(group_shap[group1_name] - group_shap[group2_name])
+        print(f"Top features with largest absolute SHAP value differences between {group1_name} and {group2_name}:")
+        print(group_shap.sort_values('abs_diff', ascending=False).head(15))
+    else:
+        print("Not enough groups for difference calculation.")
+    print("SHAP analysis by group complete.")
+FEATURE_REASON_MAP = {
+    "CREDIT_INCOME_PERCENT": "High loan-to-income ratio",
+    "AMT_ANNUITY": "High monthly repayment burden",
+    "DAYS_EMPLOYED": "Short employment history",
+    "DAYS_BIRTH": "Young applicant age",
+    "EXT_SOURCE_1": "Low external credit score",
+    "EXT_SOURCE_2": "Low external credit score",
+    "EXT_SOURCE_3": "Low external credit score",
+    "BUREAU_AMT_CREDIT_SUM_SUM": "High outstanding credit from credit bureau",
+    "BUREAU_DAYS_CREDIT_MEAN": "Recent credit activity",
+    "AMT_CREDIT": "Large requested loan amount",
+}
+def proxy_discrimination_score(shap_df, group_col):
+    group_means = shap_df.groupby(group_col).mean()
+    return (group_means.max() - group_means.min()).abs().sort_values(ascending=False)
+
+def generate_reason_for_rejection(
+    shap_explanations,
+    max_reasons=3
+):
+    reasons = []
+
+    for item in shap_explanations["top_positive_factors"]:
+        feat = item["feature"]
+
+        # clean feature name
+        clean_feat = feat.replace("num__", "").replace("cat__", "")
+
+        for key in FEATURE_REASON_MAP:
+            if key in clean_feat:
+                reasons.append(FEATURE_REASON_MAP[key])
+                break
+
+        if len(reasons) >= max_reasons:
+            break
+
+    if not reasons:
+        reasons.append("Overall high predicted credit risk")
+
+    return list(dict.fromkeys(reasons))
