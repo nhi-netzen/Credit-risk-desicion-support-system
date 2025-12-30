@@ -1,0 +1,45 @@
+def fairness_check(dp_gap, threshold):
+    if dp_gap > threshold:
+        return "FAIRNESS_VIOLATION"
+    return "FAIR"
+
+def fairness_metrics_from_labels(X, y_true, y_pred, group_col, min_samples=50):
+    df = X.copy()
+    df["y_true"] = y_true
+    df["y_pred"] = y_pred
+
+    metrics = {}
+    group_counts = df[group_col].value_counts()
+
+    valid_groups = group_counts[group_counts >= min_samples].index.tolist()
+
+    print(f"\n--- Detailed Fairness Report (Min samples: {min_samples}) ---")
+    print(f"{'Group':<50} | {'Count':<6} | {'DP (Reject Rate)':<18} | {'TPR':<10} | {'FPR':<10}")
+    print("-" * 105)
+
+    for g in valid_groups:
+        dfg = df[df[group_col] == g]
+        tn, fp, fn, tp = confusion_matrix(
+            dfg["y_true"], dfg["y_pred"], labels=[0, 1]
+        ).ravel()
+
+        dp = dfg["y_pred"].mean()
+        tpr = tp / (tp + fn + 1e-6)
+        fpr = fp / (fp + tn + 1e-6)
+
+        metrics[g] = {"DP": dp, "TPR": tpr, "FPR": fpr}
+        print(f"{g:<50} | {len(dfg):<6} | {dp:.4f}             | {tpr:.4f}     | {fpr:.4f}")
+
+    if len(metrics) < 2:
+        return metrics, {"DP_gap": 0.0, "TPR_gap": 0.0, "FPR_gap": 0.0}
+
+    dp_vals = [m["DP"] for m in metrics.values()]
+    tpr_vals = [m["TPR"] for m in metrics.values()]
+    fpr_vals = [m["FPR"] for m in metrics.values()]
+
+    gaps = {
+       "DP_gap": max(dp_vals) - min(dp_vals),
+       "TPR_gap": max(tpr_vals) - min(tpr_vals),
+       "FPR_gap": max(fpr_vals) - min(fpr_vals)
+    }
+    return metrics, gaps
