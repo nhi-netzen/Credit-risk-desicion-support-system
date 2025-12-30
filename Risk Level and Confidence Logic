@@ -1,0 +1,19 @@
+def get_risk_assessment(risk_score, low_risk_threshold=0.1, medium_risk_threshold=0.3,
+                        low_confidence_threshold=0.05, high_confidence_threshold=0.5):
+  
+    if risk_score < low_risk_threshold:
+        risk_level = 'LOW'
+    elif risk_score < medium_risk_threshold:
+        risk_level = 'MEDIUM'
+    else:
+        risk_level = 'HIGH'
+
+    certainty = max(risk_score, 1 - risk_score)
+
+    if certainty > high_confidence_threshold:
+        confidence = 'HIGH'
+    elif certainty > low_confidence_threshold:
+        confidence = 'MEDIUM'
+    else:
+        confidence = 'LOW'
+    return risk_level, confidence
