@@ -1,0 +1,149 @@
+def fairness_controller(scores, groups, base_threshold, epsilon=0.1, max_iter=100):
+    thresholds = {g: base_threshold for g in np.unique(groups)}
+    gap_history = []
+
+    for _ in range(max_iter):
+        preds = np.array([
+            int(scores[i] >= thresholds[groups[i]])
+            for i in range(len(scores))
+        ])
+
+        dp = {g: preds[groups == g].mean() for g in thresholds}
+        gap = max(dp.values()) - min(dp.values())
+        gap_history.append(gap)
+
+        if gap <= epsilon:
+            break
+
+        advantaged = max(dp, key=dp.get)
+        thresholds[advantaged] = min(thresholds[advantaged] + 0.01, 0.9)
+
+    return thresholds, gap_history
+def multi_objective_fairness_controller(
+    scores, y_true, groups, base_threshold, EAD,
+    lambda_dp=1.0,
+    lambda_tpr=1.0,
+    lambda_loss=0.5,
+    LGD=0.45,
+    epsilon=0.1,
+    max_iter=200
+):
+    thresholds = {g: base_threshold for g in np.unique(groups)}
+
+    for _ in range(max_iter):
+        preds = np.array([
+            int(scores[i] >= thresholds[groups[i]])
+            for i in range(len(scores))
+        ])
+
+        df = pd.DataFrame({
+            "y_true": y_true,
+            "y_pred": preds,
+            "score": scores,
+            "group": groups
+        })
+
+        metrics = {}
+        for g, dfg in df.groupby("group"):
+            tn, fp, fn, tp = confusion_matrix(
+                dfg["y_true"], dfg["y_pred"], labels=[0,1]
+            ).ravel()
+            metrics[g] = {
+                "DP": dfg["y_pred"].mean(),
+                "TPR": tp / (tp + fn + 1e-6)
+            }
+
+        dp_vals = [m["DP"] for m in metrics.values()]
+        tpr_vals = [m["TPR"] for m in metrics.values()]
+
+        dp_gap = max(dp_vals) - min(dp_vals)
+        tpr_gap = max(tpr_vals) - min(tpr_vals)
+
+        expected_loss = np.mean(preds * np.asarray(EAD) * LGD)
+
+        objective = (
+            lambda_dp * dp_gap +
+            lambda_tpr * tpr_gap +
+            lambda_loss * expected_loss
+        )
+
+        if dp_gap <= epsilon and tpr_gap <= epsilon:
+            break
+
+        worst_group = max(metrics, key=lambda g: metrics[g]["DP"])
+        thresholds[worst_group] += 0.01
+        thresholds[worst_group] = min(thresholds[worst_group], 0.9)
+
+    return thresholds, {
+        "DP_gap": dp_gap,
+        "TPR_gap": tpr_gap,
+        "Expected_Loss": expected_loss,
+        "Objective": objective
+    }
+def optimize_threshold_cost_benefit(
+    y_true, y_prob, EAD,
+    interest_rate=0.1, LGD=0.45, min_threshold= 0.05
+):
+    thresholds = np.linspace(min_threshold, 0.99, 100)
+    profits = []
+
+    for th in thresholds:
+        y_pred = (y_prob >= th).astype(int)
+
+        tn, fp, fn, tp = confusion_matrix(
+            y_true, y_pred, labels=[0, 1]
+        ).ravel()
+
+        # Profit = lãi từ khách GOOD - lỗ từ khách BAD
+        profit_good = np.sum((y_pred==0) * (y_true==0) * interest_rate * EAD)
+        loss_bad = np.sum((y_pred==0) * (y_true==1) * LGD * EAD)
+
+        profits.append(profit_good - loss_bad)
+
+    best_th = thresholds[np.argmax(profits)]
+    return best_th, thresholds, profits
+
+def equalized_odds_thresholding(
+    y_true, y_prob, groups,
+    base_threshold,
+    target_fpr=0.15,
+    min_delta=-0.1,
+    max_delta=0.1,
+    min_samples_per_group=10
+):
+    group_thresholds = {}
+    print(f"\n--- Debug Controller (Target FPR: {target_fpr}) ---")
+
+    unique_groups = np.unique(groups)
+
+    for g in unique_groups:
+        mask = (groups == g)
+        if mask.sum() < min_samples_per_group:
+            group_thresholds[g] = base_threshold
+            continue
+
+        y_true_g = y_true[mask]
+        y_prob_g = y_prob[mask]
+
+        if len(np.unique(y_true_g)) < 2:
+            group_thresholds[g] = base_threshold
+            continue
+
+        try:
+            fpr, tpr, ths = roc_curve(y_true_g, y_prob_g, drop_intermediate=False)
+            idx = np.argmin(np.abs(fpr - target_fpr))
+            best_th_group = ths[idx]
+
+            if np.isinf(best_th_group):
+                best_th_group = base_threshold
+
+            final_th = np.clip(best_th_group, base_threshold + min_delta, base_threshold + max_delta)
+
+            group_thresholds[g] = final_th
+            print(f"Group {g}: Base={base_threshold:.3f} -> New={final_th:.3f} (FPR={fpr[idx]:.3f})")
+
+        except Exception as e:
+            print(f"Group {g}: Error calc ROC ({e}). Using base threshold.")
+            group_thresholds[g] = base_threshold
+
+    return group_thresholds
