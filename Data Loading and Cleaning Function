@@ -1,0 +1,24 @@
+def load_and_clean_data(path):
+    app_train = pd.read_csv(path + "application_train.csv")
+    app_test  = pd.read_csv(path + "application_test.csv")
+    bureau = pd.read_csv(path + "bureau.csv")
+    bureau_bal = pd.read_csv(path + "bureau_balance.csv")
+    prev = pd.read_csv(path + "previous_application.csv")
+    pos = pd.read_csv(path + "POS_CASH_balance.csv")
+    install = pd.read_csv(path + "installments_payments.csv")
+    cc = pd.read_csv(path + "credit_card_balance.csv")
+
+    # Apply cleaning after loading
+    app_train = clean_nan(app_train)
+    app_test = clean_nan(app_test)
+    bureau = clean_nan(bureau)
+    bureau_bal = clean_nan(bureau_bal)
+    prev = clean_nan(prev)
+    pos = clean_nan(pos)
+    install = clean_nan(install)
+    cc = clean_nan(cc)
+
+    return app_train, app_test, bureau, bureau_bal, prev, pos, install, cc
+
+def clean_infinity(df):
+    return df.replace([np.inf, -np.inf], np.nan)
