@@ -1,0 +1,48 @@
+def fairness_metrics(X, y_true, y_score, group_col, threshold, min_samples=1000):
+   df = X.copy()
+   df["y_true"] = y_true
+   df["y_pred"] = (y_score >= threshold).astype(int)
+   valid_groups = df[group_col].value_counts()
+   valid_groups = valid_groups[valid_groups > min_samples].index.tolist()
+   if len(valid_groups) < 2:
+        return {}, {"DP_gap": 0.0, "TPR_gap": 0.0, "FPR_gap": 0.0}
+   metrics = {}
+   for g in valid_groups:
+        dfg = df[df[group_col] == g]
+        try:
+            tn, fp, fn, tp = confusion_matrix(dfg["y_true"], dfg["y_pred"], labels=[0, 1]).ravel()
+            tpr = tp / (tp + fn + 1e-6)
+            fpr = fp / (fp + tn + 1e-6)
+        except ValueError:
+            tpr, fpr = 0.0, 0.0
+
+        metrics[g] = {
+            "DP": dfg["y_pred"].mean(), 
+            "TPR": tpr,
+            "FPR": fpr
+        }
+
+   dp_vals = [m["DP"] for m in metrics.values()]
+   tpr_vals = [m["TPR"] for m in metrics.values()]
+   fpr_vals = [m["FPR"] for m in metrics.values()]
+
+   gaps = {
+      "DP_gap": max(dp_vals) - min(dp_vals),
+      "TPR_gap": max(tpr_vals) - min(tpr_vals),
+      "FPR_gap": max(fpr_vals) - min(fpr_vals)
+   }
+   return metrics, gaps
+def compute_reweighing_weights(y, sensitive, eps=1e-6):
+    df = pd.DataFrame({"y": y, "a": sensitive})
+
+    p_y = df["y"].value_counts(normalize=True)
+    p_a = df["a"].value_counts(normalize=True)
+    p_ay = df.value_counts(normalize=True)
+
+    weights = []
+    for _, row in df.iterrows():
+        denom = p_ay.get((row["a"], row["y"]), eps)
+        w = (p_y[row["y"]] * p_a[row["a"]]) / denom
+        weights.append(w)
+
+    return np.array(weights)
